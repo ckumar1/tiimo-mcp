@@ -136,6 +136,23 @@ server.tool(
 );
 
 server.tool(
+  "create_list",
+  "Create a new to-do list (e.g. a project or context). Returns the server-assigned listId you can then create tasks in.",
+  {
+    title: z.string().describe("List name"),
+    description: z.string().optional(),
+    selectedGrouping: z
+      .string()
+      .optional()
+      .describe('How tasks group in the UI, e.g. "Priority" or "Manual" (default "Priority")'),
+  },
+  tool(async (a: { title: string; description?: string; selectedGrouping?: string }) => {
+    const l = await client.createTaskList(a);
+    return { created: true, listId: l.todoTaskListId, title: l.title };
+  }),
+);
+
+server.tool(
   "list_activities",
   "List calendar activities (scheduled/recurring events) in a date range. Dates are YYYY-MM-DD. Returns a map keyed by date.",
   {
@@ -179,6 +196,44 @@ server.tool(
     await client.setActivityAction(activityId, instanceDate, "Reset");
     return { activityId, instanceDate, action: "Reset" };
   }),
+);
+
+server.tool(
+  "create_activity",
+  "Schedule a ONE-OFF calendar activity (timed event). startTime is naive 'YYYY-MM-DDTHH:MM:SS' treated as UTC; provide a duration in seconds. Recurring events are not supported by this tool.",
+  {
+    title: z.string(),
+    startTime: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/)
+      .describe("Start, naive 'YYYY-MM-DDTHH:MM:SS' (UTC)"),
+    durationSec: z.number().int().positive().describe("Event length in seconds"),
+    description: z.string().optional(),
+    icon: z.string().optional().describe("A single unicode emoji"),
+    timeOfDay: z
+      .enum(["Morning", "Afternoon", "Evening", "Night"])
+      .optional()
+      .describe("Which day-section to group under (default Morning)"),
+  },
+  tool(
+    async (a: {
+      title: string;
+      startTime: string;
+      durationSec: number;
+      description?: string;
+      icon?: string;
+      timeOfDay?: "Morning" | "Afternoon" | "Evening" | "Night";
+    }) => {
+      const act = await client.createActivity(a);
+      return {
+        created: true,
+        activityId: act.activityId,
+        title: act.title,
+        startTime: act.startTime,
+        endTime: act.endTime,
+      };
+    },
+  ),
 );
 
 const transport = new StdioServerTransport();

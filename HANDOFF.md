@@ -2,30 +2,26 @@
 
 Bead: **qc-yo6uz**. Full reverse-engineered API map is in that bead's notes (authoritative — read it first). This file is the "what's left" plan.
 
-## State (2026-06-05)
+## State (2026-06-05, session 2 — COMPLETE)
 
 Standalone repo at `~/tools/tiimo-mcp` (its own git repo, NOT in q-core or the gt workspace). Node 25, TypeScript, ESM, `@modelcontextprotocol/sdk`.
 
-**Done & verified:**
-- `src/client.ts` — typed Tiimo client. Encodes the VERIFIED endpoints: list lists, list/get/create/update/complete/uncomplete/delete tasks, list activities, complete/reset activity. Fail-loud errors (401 → "re-grab token"). UUIDv7 generator. Eventual-consistency-aware `updateTask` (re-reads before PUT).
-- `src/index.ts` — MCP stdio server, 10 tools registered.
-- `npm run build` is green; smoke test passes (server initializes + `tools/list` returns all 10 tools).
-- The raw API round-trip (create → PUT update → complete → delete) was proven in-browser on Cherub's real account during recon (account fully restored afterward).
+**Done & verified against Cherub's REAL account (in-page, via the app's own auth — token never extracted):**
+- `src/client.ts` — typed Tiimo client. All endpoints VERIFIED live.
+- `src/index.ts` — MCP stdio server, **12 tools** (added `create_list`, `create_activity`).
+- `npm run build` green; smoke test passes (`tools/list` → 12 tools).
+- **Full task round-trip PROVEN end-to-end** on the real account: create → (wait ~6s) → complete (PUT) → delete, with cleanup confirmed (0 leftovers).
+- **`create_list` verified**: `POST /todo-task-lists` → 200, server-assigned id; DELETE → 204.
+- **`create_activity` verified**: `POST /activities` → 201, server-assigned uuidv4 id; one-off (`repetition:null`) accepted; DELETE → 204. Tested on a far-past date (no device notification), cleaned up.
 
-## Remaining work (well-scoped)
+### 🐛 BUG FOUND & FIXED (the important one)
+The backend **ignores the client-supplied `taskId` (and list/activity id) and assigns its own**, echoing the full created entity in the response. The old `createTask` returned the *local* id → every later update/complete/delete on a freshly-created task would have 404'd. Fixed: all three `create*` methods now **return the server's echoed entity**. The recon's "in-browser round-trip" masked this (it didn't chain create→update by the returned id).
 
-1. **Live end-to-end test of the built server** — BLOCKED on the token, which the recon agent could not read (the Chrome MCP safety filter redacts it). Cherub must:
-   - Grab `TIIMO_TOKEN` + `TIIMO_PROFILE_ID` per `.env.example` (DevTools → Network → api.tiimoapp.com → Authorization header; profileId is in the URL path).
-   - `cp .env.example .env`, fill them in.
-   - Then run a real round-trip through the server's tools (create_task → wait ~5s for eventual consistency → complete_task → delete_task) and confirm in the Tiimo app. Use a clearly-labeled test task and delete it.
+## Remaining work (optional / future)
 
-2. **`create_list` and `create_activity` tools** — NOT implemented; their POST bodies were not captured (guessing risks junk — POST-insert duplicated tasks during recon). Capture each by instrumenting `window.fetch`/XHR in the web app and doing one real UI create (a list, and a calendar event), then implement:
-   - `create_list`: likely `POST /api/profiles/{pid}/todo-task-lists`.
-   - `create_activity`: likely `POST /api/profiles/{pid}/activities` — body is complex (startTime/endTime/duration, UTC+local, `recurrence`/`repetition`, `grouping` by time-of-day). Capture the minimal accepted body.
-
-3. **README.md** — install/config: how to get the token, env vars, the `.mcp.json` / Claude config snippet, the tool surface, and the BIG caveat (private API, ~5-day token, eventually consistent, can break without notice).
-
-4. **Optional later:** replace manual token paste with the OpenIddict refresh-token flow (IdP `auth.tiimoapp.com`, `/connect/token`). Needs client_id + refresh_token captured from the login flow.
+1. **Run the installed server with a real token** — the contract is fully proven, but the actual `node dist/index.js` process reading `.env` still wants a smoke run. Cherub: `cp .env.example .env`, grab the token via the README's `/api/auth/session` one-liner (profile id is `<your-profile-id>`), then exercise a tool. Pure plumbing — the API behavior is verified.
+2. **Recurring `create_activity`** — only one-off creation is verified; the `repetition` create-shape is unverified (read-only so far). Deliberately not exposed. Capture a real recurring-create body before implementing.
+3. **Optional:** replace manual token paste with the OpenIddict refresh-token flow (IdP `auth.tiimoapp.com`, `/connect/token`). Needs client_id + refresh_token from the login flow.
 
 ## Gotchas (do not relearn the hard way)
 

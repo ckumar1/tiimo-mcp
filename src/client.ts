@@ -14,8 +14,12 @@
  *     event-sourced via /activityactions (it does NOT mutate the activity).
  *
  * Quirks learned the hard way (see qc-yo6uz):
- *   - CREATE task = POST /todo-tasks and is INSERT-ONLY. POSTing an existing
- *     taskId creates a DUPLICATE — it is NOT an upsert.
+ *   - CREATE task = POST /todo-tasks is INSERT-ONLY and the backend ASSIGNS ITS
+ *     OWN id, IGNORING the taskId we send (verified: the id in the response body
+ *     differs from the one posted). It echoes the full created entity, so we
+ *     MUST read the id back from the response — returning our locally-generated
+ *     id would make every later update/complete/delete 404. Same for lists and
+ *     activities. (POSTing the "same" body twice therefore always duplicates.)
  *   - UPDATE/COMPLETE task = PUT /todo-tasks (the COLLECTION, full object in
  *     body). PUT /todo-tasks/{id} and PATCH both 405.
  *   - The backend is EVENTUALLY CONSISTENT (~4-8s). A freshly-created task is
@@ -193,8 +197,9 @@ export class TiimoClient {
   }
 
   /**
-   * Create a task. POST is insert-only; we generate a fresh UUIDv7 so we never
-   * collide with (and thus duplicate) an existing task.
+   * Create a task. We send a UUIDv7 for shape-validity, but the server REASSIGNS
+   * its own taskId and ignores ours (see file header), so we return the server's
+   * echoed entity — never our local copy — to give callers the real, usable id.
    */
   async createTask(input: {
     listId: string;
@@ -222,8 +227,15 @@ export class TiimoClient {
       subTasks: [],
       grouping: { groupingType: "Manual", groupLabel: "Todo" },
     };
-    await this.req("POST", this.p("/todo-tasks"), task);
-    return task;
+    const created = (await this.req("POST", this.p("/todo-tasks"), task)) as TodoTask | undefined;
+    if (created && typeof created === "object" && typeof created.taskId === "string") {
+      return created;
+    }
+    throw new TiimoError(
+      "Tiimo create returned no task — it normally echoes the full created task (with the server-assigned id). The create contract may have changed; re-map against the web app.",
+      0,
+      created,
+    );
   }
 
   /**
@@ -262,6 +274,39 @@ export class TiimoClient {
     await this.req("DELETE", this.p(`/todo-tasks/${taskId}`));
   }
 
+  /**
+   * Create a new to-do list. Same insert-only/server-reassigns-id contract as
+   * tasks (POST /todo-task-lists → 200, full list echoed with the server's id).
+   * sortOrder defaults to the current list count so the new list appends.
+   */
+  async createTaskList(input: {
+    title: string;
+    description?: string;
+    selectedGrouping?: string; // e.g. "Priority" | "Manual"
+  }): Promise<TodoTaskList> {
+    const existing = await this.listTaskLists();
+    const list = {
+      todoTaskListId: uuidv7(),
+      profileId: this.profileId,
+      title: input.title,
+      description: input.description ?? null,
+      selectedGrouping: input.selectedGrouping ?? "Priority",
+      sortOrder: existing.length,
+      items: [],
+    };
+    const created = (await this.req("POST", this.p("/todo-task-lists"), list)) as
+      | TodoTaskList
+      | undefined;
+    if (created && typeof created === "object" && typeof created.todoTaskListId === "string") {
+      return created;
+    }
+    throw new TiimoError(
+      "Tiimo list-create returned no list — the contract may have changed; re-map against the web app.",
+      0,
+      created,
+    );
+  }
+
   // ---- Calendar activities -------------------------------------------------
 
   /** fromDate/toDate are YYYY-MM-DD. Returns a map keyed by date (recurrence pre-expanded). */
@@ -289,4 +334,93 @@ export class TiimoClient {
       activityId,
     });
   }
+
+  /**
+   * Create a ONE-OFF (non-recurring) calendar activity. POST /activities → 201,
+   * server-assigns the id (uuidv4) and echoes the full 38-field entity, which we
+   * return. startTime is naive "YYYY-MM-DDTHH:MM:SS" and is treated as UTC by the
+   * backend (it stores startTimeUtc == startTime, leaves the *Local fields at the
+   * 0001-01-01 sentinel, offset 00:00:00) — the same shape the web app persists.
+   *
+   * Recurrence is intentionally NOT exposed here: every recurring activity rides a
+   * `repetition` object whose accepted shape we have not verified for *creation*
+   * (only read). Sending repetition:null creates a clean single event (verified).
+   * Recurring-create is future work — do not guess the repetition body.
+   */
+  async createActivity(input: {
+    title: string;
+    startTime: string; // "YYYY-MM-DDTHH:MM:SS", treated as UTC
+    durationSec: number;
+    description?: string;
+    icon?: string; // unicode emoji
+    backgroundColor?: string;
+    type?: string; // Tiimo activity type, e.g. "Play"
+    timeOfDay?: "Morning" | "Afternoon" | "Evening" | "Night";
+  }): Promise<TiimoActivity> {
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(input.startTime)) {
+      throw new TiimoError(
+        `startTime must be naive "YYYY-MM-DDTHH:MM:SS" (got ${input.startTime}).`,
+        0,
+      );
+    }
+    const endTime = addSecondsNaive(input.startTime, input.durationSec);
+    const ZERO_UUID = "00000000-0000-0000-0000-000000000000";
+    const activity = {
+      activityId: uuidv7(), // ignored by the server, which assigns its own
+      title: input.title,
+      description: input.description ?? "",
+      type: input.type ?? "Play",
+      state: null,
+      sortPriority: 1500,
+      pausedTime: null,
+      startTime: input.startTime,
+      endTime,
+      duration: input.durationSec,
+      startTimeActual: input.startTime,
+      endTimeActual: endTime,
+      durationActual: input.durationSec,
+      durationPaused: 0,
+      completedAt: null,
+      isAllDay: false,
+      iconId: input.icon ?? "📌",
+      iconUrl: null,
+      iconType: "UnicodeEmoji",
+      backgroundColor: input.backgroundColor ?? "#F3F3D1",
+      isRepeating: false,
+      recurrenceType: null,
+      repetition: null,
+      tagIds: [],
+      checklist: null,
+      origin: null,
+      calendarId: ZERO_UUID,
+      externalEventId: null,
+      blockRecurrenceUpdateExternalEvent: false,
+      taskEnrichmentId: ZERO_UUID,
+      grouping: { groupingType: "TimeOfDay", groupingLabel: input.timeOfDay ?? "Morning" },
+      allowEarlyStart: true,
+      allowEarlyEnd: true,
+      startTimeUtc: input.startTime,
+      endTimeUtc: endTime,
+      startTimeLocal: "0001-01-01T00:00:00",
+      endTimeLocal: "0001-01-01T00:00:00",
+      timeUtcOffset: "00:00:00",
+    };
+    const created = (await this.req("POST", this.p("/activities"), activity)) as
+      | TiimoActivity
+      | undefined;
+    if (created && typeof created === "object" && typeof created.activityId === "string") {
+      return created;
+    }
+    throw new TiimoError(
+      "Tiimo activity-create returned no activity — the contract may have changed; re-map against the web app.",
+      0,
+      created,
+    );
+  }
+}
+
+/** Add seconds to a naive "YYYY-MM-DDTHH:MM:SS" timestamp, returning the same format. */
+function addSecondsNaive(naive: string, seconds: number): string {
+  const ms = new Date(`${naive}Z`).getTime() + seconds * 1000;
+  return new Date(ms).toISOString().replace(/\.\d+Z$/, "");
 }
