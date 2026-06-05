@@ -21,6 +21,7 @@ the server's error so a shape-drift is obvious and easy to re-map.
 | `complete_task` / `uncomplete_task` | Check / uncheck a task |
 | `delete_task` | Delete a task |
 | `create_list` | Create a new to-do list |
+| `delete_list` | Permanently delete a to-do list (and all its tasks) |
 | `list_activities` | List calendar activities in a date range (recurrence pre-expanded) |
 | `complete_activity` / `reset_activity` | Mark a calendar activity occurrence done / not-done for a date |
 | `create_activity` | Schedule a **one-off** (non-recurring) timed event |

@@ -307,6 +307,10 @@ export class TiimoClient {
     );
   }
 
+  async deleteTaskList(listId: string): Promise<void> {
+    await this.req("DELETE", this.p(`/todo-task-lists/${listId}`));
+  }
+
   // ---- Calendar activities -------------------------------------------------
 
   /** fromDate/toDate are YYYY-MM-DD. Returns a map keyed by date (recurrence pre-expanded). */

@@ -153,6 +153,16 @@ server.tool(
 );
 
 server.tool(
+  "delete_list",
+  "Permanently delete a to-do list and all tasks in it.",
+  { listId: z.string().describe("List id from list_task_lists") },
+  tool(async ({ listId }: { listId: string }) => {
+    await client.deleteTaskList(listId);
+    return { deleted: true, listId };
+  }),
+);
+
+server.tool(
   "list_activities",
   "List calendar activities (scheduled/recurring events) in a date range. Dates are YYYY-MM-DD. Returns a map keyed by date.",
   {
