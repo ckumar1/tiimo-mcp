@@ -19,7 +19,7 @@ The backend **ignores the client-supplied `taskId` (and list/activity id) and as
 
 ## Remaining work (optional / future)
 
-1. **Run the installed server with a real token** — the contract is fully proven, but the actual `node dist/index.js` process reading `.env` still wants a smoke run. Cherub: `cp .env.example .env`, grab the token via the README's `/api/auth/session` one-liner (profile id is `<your-profile-id>`), then exercise a tool. Pure plumbing — the API behavior is verified.
+1. **Run the installed server with a real token** — the contract is fully proven, but the actual `node dist/index.js` process reading `.env` still wants a smoke run. Cherub: `cp .env.example .env`, grab the token via the README's `/api/auth/session` one-liner (profile id from `GET /api/profiles`), then exercise a tool. Pure plumbing — the API behavior is verified.
 2. **Recurring `create_activity`** — only one-off creation is verified; the `repetition` create-shape is unverified (read-only so far). Deliberately not exposed. Capture a real recurring-create body before implementing.
 3. **Optional:** replace manual token paste with the OpenIddict refresh-token flow (IdP `auth.tiimoapp.com`, `/connect/token`). Needs client_id + refresh_token from the login flow.
 
