@@ -28,6 +28,38 @@
  *     first and surfaces a clear "not yet visible" error instead of corrupting.
  */
 
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+/**
+ * Resolve the access token FRESH from the package `.env` on every request,
+ * falling back to the value supplied at construction (process.env.TIIMO_TOKEN).
+ *
+ * Why: the Tiimo access token expires every ~5 days and the MCP server is a
+ * long-lived subprocess. Reading process.env ONCE at startup meant a refreshed
+ * token never took effect without a full host restart — an MCP `reconnect` does
+ * not reliably re-launch the process with fresh env, so the server stayed wedged
+ * on a stale, expired token (observed 2026-06-11: token valid everywhere on
+ * disk, server still 401ing). Re-reading `.env` at request time makes a refresh
+ * a one-line edit that the NEXT call picks up — no restart, no reconnect.
+ */
+function readEnvToken(): string | undefined {
+  try {
+    // dist/client.js -> package root/.env ; src/client.ts (tsx) -> same layout.
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const txt = readFileSync(join(root, ".env"), "utf8");
+    const m = txt.match(/^\s*TIIMO_TOKEN\s*=\s*(.*?)\s*$/m);
+    if (m) {
+      const v = m[1].trim().replace(/^["']|["']$/g, "");
+      if (v) return v;
+    }
+  } catch {
+    // no readable .env — token came purely from process.env, which is fine.
+  }
+  return undefined;
+}
+
 export interface TiimoConfig {
   token: string;
   profileId: string;
@@ -119,24 +151,31 @@ function tiimoNow(): string {
 export class TiimoClient {
   private readonly base: string;
   private readonly profileId: string;
-  private readonly token: string;
+  /** Construction-time token (process.env.TIIMO_TOKEN); fallback only. */
+  private readonly initialToken: string;
 
   constructor(cfg: TiimoConfig) {
     // Lenient on purpose: the MCP server must start and list its tools even
     // without creds. Missing config surfaces as a clear error when a tool runs.
-    this.token = cfg.token;
+    this.initialToken = cfg.token;
     this.profileId = cfg.profileId;
     this.base = (cfg.apiBase ?? "https://api.tiimoapp.com/api").replace(/\/$/, "");
   }
 
-  private async req(method: string, path: string, body?: unknown): Promise<unknown> {
-    if (!this.token) throw new TiimoError("TIIMO_TOKEN is not set — see .env.example for how to get it.", 0);
+  /** Freshest token: package .env (re-read per call) wins over the startup value. */
+  private resolveToken(): string {
+    return readEnvToken() ?? this.initialToken;
+  }
+
+  private async req(method: string, path: string, body?: unknown, retried = false): Promise<unknown> {
+    const token = this.resolveToken();
+    if (!token) throw new TiimoError("TIIMO_TOKEN is not set — see .env.example for how to get it.", 0);
     if (!this.profileId) throw new TiimoError("TIIMO_PROFILE_ID is not set — see .env.example.", 0);
     const url = `${this.base}${path}`;
     const res = await fetch(url, {
       method,
       headers: {
-        authorization: `Bearer ${this.token}`,
+        authorization: `Bearer ${token}`,
         ...(body !== undefined ? { "content-type": "application/json" } : {}),
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -152,8 +191,17 @@ export class TiimoClient {
     }
     if (!res.ok) {
       if (res.status === 401) {
+        // The token may have just been refreshed in .env mid-session. Re-read it
+        // once and retry before giving up, so a live refresh self-heals without
+        // a restart.
+        if (!retried) {
+          const fresh = readEnvToken();
+          if (fresh && fresh !== token) {
+            return this.req(method, path, body, true);
+          }
+        }
         throw new TiimoError(
-          "Tiimo rejected the token (401). It likely expired (~5-day lifetime) — re-grab TIIMO_TOKEN from the web app's DevTools Network tab.",
+          "Tiimo rejected the token (401). It likely expired (~5-day lifetime) — update TIIMO_TOKEN in the tiimo-mcp .env (grab a fresh one from webapp.tiimoapp.com DevTools). The server re-reads .env live, so the next call picks it up — no restart needed.",
           401,
           parsed,
         );
