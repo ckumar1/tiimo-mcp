@@ -28,36 +28,130 @@
  *     first and surfaces a clear "not yet visible" error instead of corrupting.
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
+/** NextAuth session endpoint that mints a fresh access token from the session cookie. */
+const DEFAULT_SESSION_URL = "https://webapp.tiimoapp.com/api/auth/session";
+
 /**
- * Resolve the access token FRESH from the package `.env` on every request,
- * falling back to the value supplied at construction (process.env.TIIMO_TOKEN).
- *
- * Why: the Tiimo access token expires every ~5 days and the MCP server is a
- * long-lived subprocess. Reading process.env ONCE at startup meant a refreshed
- * token never took effect without a full host restart — an MCP `reconnect` does
- * not reliably re-launch the process with fresh env, so the server stayed wedged
- * on a stale, expired token (observed 2026-06-11: token valid everywhere on
- * disk, server still 401ing). Re-reading `.env` at request time makes a refresh
- * a one-line edit that the NEXT call picks up — no restart, no reconnect.
+ * Absolute path to the package `.env` (works for both dist/*.js and tsx src/*.ts).
+ * Honours a `TIIMO_ENV_FILE` override — useful for pointing the MCP at a specific
+ * env file, and for isolating tests from a developer's real `.env`.
  */
-function readEnvToken(): string | undefined {
+export function envPath(): string {
+  if (process.env.TIIMO_ENV_FILE) return process.env.TIIMO_ENV_FILE;
+  // dist/client.js -> package root/.env ; src/client.ts (tsx) -> same layout.
+  return join(dirname(fileURLToPath(import.meta.url)), "..", ".env");
+}
+
+/**
+ * Read a single `KEY=value` from the package `.env`, FRESH on every call.
+ *
+ * Why re-read per call: the Tiimo access token expires every ~5 days and the MCP
+ * server is a long-lived subprocess. Reading process.env ONCE at startup meant a
+ * refreshed token never took effect without a full host restart — an MCP
+ * `reconnect` does not reliably re-launch the process with fresh env, so the
+ * server stayed wedged on a stale, expired token (observed 2026-06-11: token
+ * valid everywhere on disk, server still 401ing). Re-reading `.env` at request
+ * time makes a refresh a one-line edit that the NEXT call picks up — no restart,
+ * no reconnect. The auto-refresh path (refreshAccessToken) writes the same file,
+ * so a self-healed token is picked up the same way.
+ */
+export function readEnvValue(key: string, path: string = envPath()): string | undefined {
   try {
-    // dist/client.js -> package root/.env ; src/client.ts (tsx) -> same layout.
-    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-    const txt = readFileSync(join(root, ".env"), "utf8");
-    const m = txt.match(/^\s*TIIMO_TOKEN\s*=\s*(.*?)\s*$/m);
+    const txt = readFileSync(path, "utf8");
+    // Match to end-of-line so values containing '=' / ';' / '%' (cookies) survive.
+    const m = txt.match(new RegExp(`^\\s*${key}\\s*=\\s*(.*?)\\s*$`, "m"));
     if (m) {
       const v = m[1].trim().replace(/^["']|["']$/g, "");
       if (v) return v;
     }
   } catch {
-    // no readable .env — token came purely from process.env, which is fine.
+    // no readable .env — value came purely from process.env, which is fine.
   }
   return undefined;
+}
+
+function readEnvToken(): string | undefined {
+  return readEnvValue("TIIMO_TOKEN");
+}
+
+/**
+ * Update `KEY=value` entries in the package `.env`, preserving every other line
+ * (comments, unrelated keys, ordering). Missing keys are appended. Written
+ * atomically (temp file + rename) so a crash mid-write can never leave a
+ * half-written .env that bricks auth. Values are written raw (no quoting) to
+ * match readEnvValue, which reads to end-of-line — safe because tokens/cookies
+ * are single-line and contain no newlines.
+ */
+export function writeEnvValues(updates: Record<string, string>, path: string = envPath()): void {
+  let txt = "";
+  try {
+    txt = readFileSync(path, "utf8");
+  } catch {
+    // create fresh
+  }
+  const remaining = new Map(Object.entries(updates));
+  const lines = txt.length ? txt.split(/\r?\n/) : [];
+  const out = lines.map((line) => {
+    const m = line.match(/^\s*([A-Za-z0-9_]+)\s*=/);
+    if (m && remaining.has(m[1])) {
+      const key = m[1];
+      const val = remaining.get(key)!;
+      remaining.delete(key);
+      return `${key}=${val}`;
+    }
+    return line;
+  });
+  for (const [key, val] of remaining) out.push(`${key}=${val}`);
+  let result = out.join("\n");
+  if (!result.endsWith("\n")) result += "\n";
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, result, "utf8");
+  renameSync(tmp, path);
+}
+
+/**
+ * Merge any ROTATED NextAuth session cookies from a response back into the
+ * stored cookie header, so the durable credential rolls forward instead of
+ * expiring at its original 30-day horizon. Handles chunked cookies
+ * (`__Secure-next-auth.session-token.0/.1`, emitted when the encrypted JWT
+ * exceeds ~4KB) by treating each chunk as its own entry, and honours cookie
+ * CLEARS (Set-Cookie with an epoch expiry / Max-Age=0). Returns the new cookie
+ * header, or null if nothing session-related changed. Pure — best-effort: the
+ * caller wraps it so a parsing quirk never breaks the (already-succeeded) token
+ * refresh.
+ */
+export function mergeRotatedCookie(
+  currentCookie: string,
+  setCookies: string[],
+): string | null {
+  if (!setCookies.length) return null;
+  const jar = new Map<string, string>();
+  for (const part of currentCookie.split(/;\s*/)) {
+    const eq = part.indexOf("=");
+    if (eq > 0) jar.set(part.slice(0, eq).trim(), part.slice(eq + 1));
+  }
+  let changed = false;
+  for (const sc of setCookies) {
+    const first = sc.split(/;\s*/)[0];
+    const eq = first.indexOf("=");
+    if (eq <= 0) continue;
+    const name = first.slice(0, eq).trim();
+    const value = first.slice(eq + 1);
+    if (!/session-token/i.test(name)) continue; // only roll the session cookie(s)
+    const cleared = value === "" || /expires=Thu,\s*01\s*Jan\s*1970|max-age=0/i.test(sc);
+    if (cleared) {
+      if (jar.delete(name)) changed = true;
+    } else if (jar.get(name) !== value) {
+      jar.set(name, value);
+      changed = true;
+    }
+  }
+  if (!changed) return null;
+  return [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
 }
 
 export interface TiimoConfig {
@@ -167,6 +261,68 @@ export class TiimoClient {
     return readEnvToken() ?? this.initialToken;
   }
 
+  /** Collapse concurrent 401-triggered refreshes into a single in-flight call. */
+  private refreshInFlight: Promise<string | null> | null = null;
+
+  /**
+   * Self-heal an expired access token WITHOUT a human token re-grab.
+   *
+   * Tiimo web auth is NextAuth.js: the OIDC refresh token is held server-side
+   * (encrypted in the session cookie, never exposed to the client), so we cannot
+   * run the raw `/connect/token` refresh ourselves. Instead we replay the browser's
+   * own refresh path: GET the NextAuth session endpoint with the stored session
+   * cookie — NextAuth performs the OIDC refresh internally and returns a fresh
+   * access token. We persist that token (and any rotated session cookie) to .env.
+   *
+   * TIIMO_SESSION_COOKIE is a ~30-day rolling credential; capture it once from the
+   * browser (see .env.example). Returns the new access token, or null if there is
+   * no cookie / the session is dead (→ fall back to the manual capture path).
+   */
+  private refreshAccessToken(): Promise<string | null> {
+    if (this.refreshInFlight) return this.refreshInFlight;
+    this.refreshInFlight = this.doRefresh().finally(() => {
+      this.refreshInFlight = null;
+    });
+    return this.refreshInFlight;
+  }
+
+  private async doRefresh(): Promise<string | null> {
+    const cookie = readEnvValue("TIIMO_SESSION_COOKIE");
+    if (!cookie) return null;
+    const url = readEnvValue("TIIMO_SESSION_URL") ?? DEFAULT_SESSION_URL;
+    let res: Response;
+    try {
+      res = await fetch(url, { headers: { cookie, accept: "application/json" } });
+    } catch {
+      return null; // network error — surface the original 401 to the caller
+    }
+    if (!res.ok) return null; // session cookie expired/invalid → manual re-capture
+    let session: { accessToken?: unknown } | undefined;
+    try {
+      session = (await res.json()) as { accessToken?: unknown };
+    } catch {
+      return null;
+    }
+    const at = session?.accessToken;
+    if (typeof at !== "string" || !at) return null; // signed-out session returns {}
+    const updates: Record<string, string> = { TIIMO_TOKEN: at };
+    try {
+      const setCookies =
+        typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
+      const rotated = mergeRotatedCookie(cookie, setCookies);
+      if (rotated) updates.TIIMO_SESSION_COOKIE = rotated;
+    } catch {
+      // rotation is best-effort; the token refresh above already succeeded
+    }
+    try {
+      writeEnvValues(updates);
+    } catch {
+      // couldn't persist — the caller's retry re-reads .env; if that still holds
+      // the old token it fails cleanly rather than looping (retried guard).
+    }
+    return at;
+  }
+
   private async req(method: string, path: string, body?: unknown, retried = false): Promise<unknown> {
     const token = this.resolveToken();
     if (!token) throw new TiimoError("TIIMO_TOKEN is not set — see .env.example for how to get it.", 0);
@@ -191,17 +347,21 @@ export class TiimoClient {
     }
     if (!res.ok) {
       if (res.status === 401) {
-        // The token may have just been refreshed in .env mid-session. Re-read it
-        // once and retry before giving up, so a live refresh self-heals without
-        // a restart.
         if (!retried) {
+          // 1) The token may have been refreshed in .env mid-session (manual edit
+          //    or a concurrent auto-refresh). Re-read once and retry.
           const fresh = readEnvToken();
           if (fresh && fresh !== token) {
             return this.req(method, path, body, true);
           }
+          // 2) Auto-refresh via the NextAuth session cookie (no human step).
+          const refreshed = await this.refreshAccessToken();
+          if (refreshed && refreshed !== token) {
+            return this.req(method, path, body, true);
+          }
         }
         throw new TiimoError(
-          "Tiimo rejected the token (401). It likely expired (~5-day lifetime) — update TIIMO_TOKEN in the tiimo-mcp .env (grab a fresh one from webapp.tiimoapp.com DevTools). The server re-reads .env live, so the next call picks it up — no restart needed.",
+          "Tiimo rejected the token (401) and auto-refresh did not recover it. Either TIIMO_SESSION_COOKIE is unset/expired or the session was signed out — re-capture it from webapp.tiimoapp.com (see .env.example) and update the tiimo-mcp .env. The server re-reads .env live, so the next call picks it up — no restart needed.",
           401,
           parsed,
         );
